@@ -1,11 +1,12 @@
 const std = @import("std");
-const Regex = @import("regex").Regex;
+const Pcre = @import("pcre2zig");
+const Regex = Pcre.CompiledCode;
 const mem = std.mem;
 
 pub const Command = enum { substitute, print, insert, quit, translate, group, label, sentinel };
 
 pub const AddressKind = union(enum) {
-    Regex: *Regex,
+    Regex: Regex,
     Line: usize,
     LastLine: void,
 };
@@ -25,8 +26,6 @@ pub const Token = union(enum) {
 };
 
 pub const TokenFifo = std.fifo.LinearFifo(Token, .Dynamic);
-
-pub const ScanError = error{ InvalidRegex, MissingCommand, Unterminated, ExtraCharacters, IOError, UnknownCommand, UnknownOption, OutOfMemory, EndOfFile };
 
 pub fn LineFeeder(comptime Source: type) type {
     return struct {
@@ -111,11 +110,7 @@ pub fn Scanner(comptime Reader: type) type {
             self.list.deinit();
         }
 
-        fn listAppend(self: *Self, x: u8) ScanError!void {
-            self.list.append(x) catch return error.OutOfMemory;
-        }
-
-        fn nextChar(self: *Self) ScanError!?u8 {
+        fn nextChar(self: *Self) !?u8 {
             if (self.char_lookahead) |c| {
                 self.char_lookahead = null;
                 return c;
@@ -127,7 +122,7 @@ pub fn Scanner(comptime Reader: type) type {
             }
         }
 
-        fn nextCharU(self: *Self) ScanError!u8 {
+        fn nextCharU(self: *Self) !u8 {
             return if (try self.nextChar()) |c| c else error.Unterminated;
         }
 
@@ -161,7 +156,7 @@ pub fn Scanner(comptime Reader: type) type {
                         return error.Unterminated;
                     }
                 }
-                try self.listAppend(b);
+                try self.list.append(b);
                 seen_backslash = b == '\\';
             }
         }
@@ -201,16 +196,11 @@ pub fn Scanner(comptime Reader: type) type {
             return false;
         }
 
-        fn regex(self: *Self, r: []const u8) ScanError!*Regex {
-            const re = Regex.compile(self.alloc, r) catch return error.InvalidRegex;
-            return &(self.alloc.dupe(Regex, &.{re}) catch return error.OutOfMemory)[0];
-        }
-
         fn tokenOut(self: *Self, t: Token) !void {
-            self.output.writeItem(t) catch return error.OutOfMemory;
+            try self.output.writeItem(t);
         }
 
-        pub fn work(self: *Self) ScanError!void {
+        pub fn work(self: *Self) !void {
             while (try self.nextChar()) |b| switch (b) {
                 '#' => {
                     // comment: eat until newline
@@ -221,19 +211,19 @@ pub fn Scanner(comptime Reader: type) type {
                 '/' => {
                     const r = try self.nextArg('/');
                     const invert = try self.maybeInvert();
-                    try self.tokenOut(.{ .Address = Address{ .kind = .{ .Regex = try self.regex(r) }, .invert = invert } });
+                    try self.tokenOut(.{ .Address = Address{ .kind = .{ .Regex = try Pcre.compile(r, .{}) }, .invert = invert } });
                 },
                 '\\' => {
                     const r = try self.nextArg(try self.getDelim());
                     const invert = try self.maybeInvert();
-                    try self.tokenOut(.{ .Address = Address{ .kind = .{ .Regex = try self.regex(r) }, .invert = invert } });
+                    try self.tokenOut(.{ .Address = Address{ .kind = .{ .Regex = try Pcre.compile(r, .{}) }, .invert = invert } });
                 },
                 '0'...'9' => {
-                    try self.listAppend(b);
+                    try self.list.append(b);
                     while (true) {
                         const new_b = (try self.nextChar()) orelse break;
                         if (std.ascii.isDigit(new_b)) {
-                            try self.listAppend(b);
+                            try self.list.append(b);
                         } else {
                             self.char_lookahead = new_b;
                             break;
@@ -277,8 +267,6 @@ pub fn scanner(reader: anytype, a: std.mem.Allocator, f: *TokenFifo) Scanner(@Ty
     return Scanner(@TypeOf(reader)).init(reader, a, f);
 }
 
-pub const GenerationError = ScanError || error{ UnexpectedToken, ExtraAddress, UnmatchedBraces };
-
 // TODO: refactor with unions instead of cursed optionals
 pub const SedInstruction = struct {
     address1: ?Address = null,
@@ -304,7 +292,7 @@ pub const Generator = struct {
         return self.output.toOwnedSlice();
     }
 
-    fn next(self: *Generator) GenerationError!Token {
+    fn next(self: *Generator) !Token {
         if (self.input.readItem()) |i| {
             return i;
         } else {
@@ -312,7 +300,7 @@ pub const Generator = struct {
         }
     }
 
-    fn argRun(self: *Generator, count: usize, out: *[5:null]?[]const u8) GenerationError!void {
+    fn argRun(self: *Generator, count: usize, out: *[5:null]?[]const u8) !void {
         // assert(out < 5)
         var i: usize = 0;
         while (i < count) : (i += 1) {
@@ -326,7 +314,7 @@ pub const Generator = struct {
         }
     }
 
-    fn groupLevel(self: *Generator, increase: bool) GenerationError!void {
+    fn groupLevel(self: *Generator, increase: bool) !void {
         if (!increase) {
             if (self.group_level == 0) {
                 return error.UnmatchedBraces;
@@ -337,7 +325,9 @@ pub const Generator = struct {
         }
     }
 
-    fn commandRun(self: *Generator, initial: ?Token) GenerationError!SedInstruction {
+    const AddressOrCommandRunError = error{ OutOfMemory, UnmatchedBraces, UnexpectedToken, IOError, EndOfFile, ExtraAddress } || Pcre.PcreError;
+
+    fn commandRun(self: *Generator, initial: ?Token) AddressOrCommandRunError!SedInstruction {
         var ret = SedInstruction{ .cmd = .sentinel };
         switch (initial orelse try self.next()) {
             .Command => |c| {
@@ -346,7 +336,7 @@ pub const Generator = struct {
                     .print, .quit => {},
                     .substitute => {
                         try self.argRun(2, &ret.args);
-                        ret.regex = Regex.compile(self.alloc, ret.args[0].?) catch return error.InvalidRegex;
+                        ret.regex = try Pcre.compile(ret.args[0].?, .{});
                     },
                     .insert => try self.argRun(1, &ret.args),
                     else => {
@@ -368,7 +358,7 @@ pub const Generator = struct {
                             break;
                         },
                         .Address, .Command, .BeginGroup => {
-                            command_buf.append((try self.addressOrCommandRun(next_t)) orelse unreachable) catch return error.OutOfMemory;
+                            try command_buf.append((try self.addressOrCommandRun(next_t)) orelse unreachable);
                         },
                         .Semicolon => continue,
                         else => return error.UnexpectedToken,
@@ -393,7 +383,7 @@ pub const Generator = struct {
             .EndGroup => {
                 // push back, see if who's calling us will handle it
                 // if not, it's an unmatched brace
-                self.input.unget(&.{t}) catch return error.OutOfMemory;
+                try self.input.unget(&.{t});
             },
             else => {
                 std.log.err("Expected newline, semicolon", .{});
@@ -403,7 +393,7 @@ pub const Generator = struct {
         return ret;
     }
 
-    fn addressOrCommandRun(self: *Generator, initial: ?Token) GenerationError!?SedInstruction {
+    fn addressOrCommandRun(self: *Generator, initial: ?Token) AddressOrCommandRunError!?SedInstruction {
         const t = initial orelse self.next() catch {
             if (self.group_level == 0) {
                 return null;
@@ -459,14 +449,12 @@ pub const Generator = struct {
         }
     }
 
-    pub fn work(self: *Generator) GenerationError!void {
+    pub fn work(self: *Generator) !void {
         while (try self.addressOrCommandRun(null)) |i| {
-            self.output.append(i) catch return error.OutOfMemory;
+            try self.output.append(i);
         }
     }
 };
-
-pub const RunnerError = error{ IOError, NotImplemented, OutOfMemory, QuitCommand, OutOfBoundCapture, BadBackslash };
 
 pub fn Runner(comptime Source: type, comptime Writer: type) type {
     return struct {
@@ -511,70 +499,41 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
             return self.in_stream.remainingSources();
         }
 
-        fn printPatternSpace(self: *Self) RunnerError!void {
+        fn printPatternSpace(self: *Self) !void {
             self.out_stream.print("{s}\n", .{self.pattern_space.items}) catch return error.IOError;
         }
 
-        fn performReplacement(self: *Self, r: *Regex, repl: []const u8, global: bool) RunnerError!void {
-            var start: usize = 0;
-            while (r.captures(self.pattern_space.items[start..]) catch return error.OutOfMemory) |caps| {
-                const area = caps.boundsAt(0) orelse return;
-                // std.debug.print("{} and {}\n", .{ area.lower, area.upper });
-                var new_string = std.ArrayList(u8).init(self.alloc);
-                defer new_string.deinit();
-                var seen_bl = false;
-                for (repl) |char| {
-                    if (seen_bl) {
-                        if (std.ascii.isDigit(char)) {
-                            new_string.appendSlice(caps.sliceAt(char - '0') orelse "") catch return error.OutOfMemory;
-                        } else {
-                            new_string.append(char) catch return error.OutOfMemory;
-                        }
-                        seen_bl = false;
-                    } else {
-                        if (char == '&') {
-                            new_string.appendSlice(caps.sliceAt(0) orelse "") catch return error.OutOfMemory;
-                        } else if (char != '\\') {
-                            new_string.append(char) catch return error.OutOfMemory;
-                        }
-                        seen_bl = char == '\\';
-                    }
-                }
-                if (seen_bl) {
-                    return error.BadBackslash;
-                }
-                // workaround for regex engine bug
-                const o_len = self.pattern_space.items.len - 1;
-                if (area.lower == o_len and area.upper == o_len) {
-                    self.pattern_space.appendSlice(new_string.items) catch return error.OutOfMemory;
-                } else {
-                    self.pattern_space.replaceRange(start + area.lower, area.upper - area.lower, new_string.items) catch return error.OutOfMemory;
-                }
-                start = start + area.lower + new_string.items.len;
-                if (!global or start >= self.pattern_space.items.len) {
-                    break;
-                }
-            }
+        fn performReplacement(self: *Self, r: Regex, repl: []const u8, global: bool) !void {
+            _ = global;
+            const subject = self.pattern_space.toOwnedSlice();
+            defer self.alloc.free(subject);
+            try self.pattern_space.ensureUnusedCapacity(1 << 16);
+            self.pattern_space.expandToCapacity();
+            const the_slice = try Pcre.replace(r, subject, 0, repl, self.pattern_space.items, .{});
+            self.pattern_space.shrinkRetainingCapacity(the_slice.len);
         }
 
-        fn matchAddress(self: *Self, a: ?Address) bool {
+        fn matchAddress(self: *Self, a: ?Address) !bool {
             if (a == null) return true;
             const ret = switch (a.?.kind) {
                 .Line => |l| self.index == l,
                 .LastLine => self.in_stream.isLastLine(),
                 .Regex => |r| {
-                    return r.match(self.pattern_space.items) catch false;
+                    var data = try Pcre.MatchData.init(r);
+                    defer data.deinit();
+                    return Pcre.match(r, self.pattern_space.items, 0, &data, .{}) catch false;
                 },
             };
             if (a.?.invert) return !ret else return ret;
         }
 
-        fn runInstructions(self: *Self, input: []SedInstruction) RunnerError!void {
+        const RunError = Pcre.PcreError || error{ OutOfMemory, QuitCommand, NotImplemented, IOError };
+        fn runInstructions(self: *Self, input: []SedInstruction) RunError!void {
             var i: usize = 0;
             while (i < input.len) : (i += 1) {
                 var item = &input[i];
 
-                if (!(item.found_first or self.matchAddress(item.address1))) {
+                if (!(item.found_first or try self.matchAddress(item.address1))) {
                     item.found_first = false;
                     continue;
                 }
@@ -585,7 +544,7 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
                         .Line => |l| l <= self.index and !a2.invert,
                         else => false,
                     };
-                    if (line_early or (item.found_first and self.matchAddress(a2))) {
+                    if (line_early or (item.found_first and try self.matchAddress(a2))) {
                         item.found_first = false;
                     } else {
                         item.found_first = true;
@@ -599,7 +558,7 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
                         try self.pattern_space.insert(0, '\n');
                         try self.pattern_space.insertSlice(0, item.args[0].?);
                     },
-                    .substitute => self.performReplacement(&item.regex.?, item.args[1].?, false) catch continue,
+                    .substitute => self.performReplacement(item.regex.?, item.args[1].?, false) catch continue,
                     .group => try self.runInstructions(item.group.?),
                     .sentinel => {
                         std.log.err("Invalid instruction, file a bug", .{});
@@ -610,12 +569,12 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
             }
         }
 
-        pub fn run(self: *Self) RunnerError!void {
+        pub fn run(self: *Self) !void {
             while (try self.in_stream.next() catch error.IOError) |l| {
                 self.index += 1;
                 defer self.alloc.free(l);
                 self.pattern_space.clearRetainingCapacity();
-                self.pattern_space.appendSlice(l) catch return error.OutOfMemory;
+                try self.pattern_space.appendSlice(l);
                 self.runInstructions(self.input) catch |e| switch (e) {
                     error.QuitCommand => {},
                     else => return e,

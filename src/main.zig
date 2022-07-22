@@ -38,16 +38,16 @@ pub fn main() !void {
     var files = std.fifo.LinearFifo(fs.File, .Dynamic).init(alloc.allocator());
     defer files.deinit();
     // Script Get
-    var got_script = true;
+    var got_script = false;
     defer res.deinit();
     for (res.args.expression) |expr, i| {
         scriptFromFixedBuffer(alloc.allocator(), &fifo, expr) catch |e| {
             std.log.err("error in expression #{d} ({s})", .{ i + 1, expr });
             return e;
         };
-    } else {
-        got_script = false;
+        got_script = true;
     }
+
     for (res.args.file) |f, i| {
         var scriptFile = try fs.cwd().openFile(f, .{});
         defer scriptFile.close();
@@ -58,6 +58,7 @@ pub fn main() !void {
             std.log.err("error in file #{}", .{i + 1});
             return e;
         };
+        got_script = true;
     }
 
     const positionals = if (!got_script) b: {

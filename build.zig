@@ -12,8 +12,12 @@ pub fn build(b: *std.build.Builder) void {
     const mode = b.standardReleaseOptions();
 
     const exe = b.addExecutable("zed", "src/main.zig");
-    exe.addPackagePath("regex", "libs/zig-regex/src/regex.zig");
+    //exe.addPackagePath("regex", "libs/zig-regex/src/regex.zig");
+    exe.addPackagePath("pcre2zig", "libs/pcre2zig/src/pcre2zig.zig");
     exe.addPackagePath("clap", "libs/zig-clap/clap.zig");
+    exe.linkLibC();
+    exe.addSystemIncludePath("/usr/include");
+    exe.linkSystemLibrary("pcre2-8");
     exe.setTarget(target);
     exe.setBuildMode(mode);
     exe.install();

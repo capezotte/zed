@@ -4,7 +4,7 @@ const Regex = Pcre.CompiledCode;
 const UnicodeView = std.unicode.Utf8View;
 const mem = std.mem;
 
-pub const Command = enum { substitute, print, delete, insert, to_hold, to_pattern, next_line, quit, translate, group, jump, tmp_jump, unambiguous_print, file };
+pub const Command = enum { substitute, print, delete, insert, to_hold, to_pattern, exchange, next_line, quit, translate, group, jump, tmp_jump, unambiguous_print, file };
 
 pub const AddressKind = union(enum) {
     Regex: Regex,
@@ -19,9 +19,13 @@ pub const SedInstruction = struct {
     address2: ?Address = null,
     found_first: bool = false,
     cmd: union(Command) {
-        insert: []const u8, // itext
+        insert: struct {
+            before: bool,
+            contents: []const u8,
+        },
         to_hold: bool, // if true: copy instead of append
         to_pattern: bool,
+        exchange: void,
         substitute: struct {
             regex: Regex, //
             repl: []const u8,
@@ -176,7 +180,7 @@ pub const Generator = struct {
 
     fn skipWhitespace(self: *Self) void {
         while (self.peekChar()) |c| switch (c) {
-            ' ', '\t', '\n' => self.index += 1,
+            ' ', '\t' => self.index += 1,
             else => return,
         };
     }
@@ -271,6 +275,7 @@ pub const Generator = struct {
                 if (seen_bl) {
                     _ = self.list.pop();
                 } else {
+                    self.index -= 1; // leave it as semicolon
                     return self.list.toOwnedSlice();
                 }
             }
@@ -329,9 +334,9 @@ pub const Generator = struct {
         while (true) {
             var ret = SedInstruction{ .cmd = .{ .tmp_jump = undefined } };
             self.skipWhitespace();
-            while (self.peekChar() == @as(u8, '#')) {
+            if (self.peekChar() == @as(u8, '#')) {
                 self.comment();
-                self.skipWhitespace();
+                continue;
             }
 
             var inline_for_break = false;
@@ -386,15 +391,12 @@ pub const Generator = struct {
                     // append, we're going to skip
                     try output.append(ret);
                     try output.appendSlice(group_cmds);
-                    continue; // no semicolons needed
+                    continue;
                 },
-                '}' => return error.ExpectedCommand,
                 'p', 'P' => ret.cmd = .{ .print = isL(cmd) },
                 'd', 'D' => ret.cmd = .{ .delete = isL(cmd) },
                 'q' => ret.cmd = .quit,
-                'i' => {
-                    ret.cmd = .{ .insert = try self.nextText() };
-                },
+                'i', 'a' => ret.cmd = .{ .insert = .{ .before = cmd == 'i', .contents = try self.nextText() } },
                 's' => {
                     const delim = try self.getDelim();
                     const regex = try Pcre.compile(try self.nextArg(delim), .{});
@@ -443,6 +445,7 @@ pub const Generator = struct {
                     label_entry.value_ptr.* = output.items.len;
                     continue; // no semicolon and no instruction output needed
                 },
+                'x' => ret.cmd = .exchange,
                 'b' => {
                     const decl = self.index;
                     const label = try self.nextLabel();
@@ -460,6 +463,20 @@ pub const Generator = struct {
                     if (ret.address1 == null) {
                         continue;
                     } else {
+                        std.log.err("Address without command found.", .{});
+                        return error.ExpectedCommand;
+                    }
+                },
+                '}' => {
+                    // avoid returning uninitialized command
+                    if (ret.address1 == null) {
+                        if (self.group_level == 0) {
+                            return error.UnmatchedBraces;
+                        }
+                        self.group_level -= 1;
+                        return output.toOwnedSlice();
+                    } else {
+                        std.log.err("Tried to make }} command accept addresses.\n", .{});
                         return error.ExpectedCommand;
                     }
                 },
@@ -503,6 +520,7 @@ pub const Generator = struct {
                     instr.cmd = .{ .jump = pos };
                 } else {
                     self.index = jmp.declared;
+                    std.log.err("Tried to use undefined label '{s}'", .{jmp.label});
                     return error.UndefinedLabel;
                 }
             },
@@ -582,6 +600,9 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
             var i: usize = 0;
             while (i < input.len) { // no : (i += 1) because of jumps
                 var item = &input[i];
+                // std.debug.print("instr {}: {}\n", .{ i, item.cmd });
+                // std.debug.print("PS: {s} :: HS: {s}\n", .{ self.pattern_space.items, self.hold_space.items });
+                // defer std.debug.print("APS: {s} :: AHS: {s}\n", .{ self.pattern_space.items, self.hold_space.items });
                 i += 1;
 
                 if (!(item.found_first or try self.matchAddress(item.address1))) {
@@ -630,9 +651,14 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
                             }
                         }
                     },
-                    .insert => |text| {
-                        try self.pattern_space.insert(0, '\n');
-                        try self.pattern_space.insertSlice(0, text);
+                    .insert => |insert| {
+                        const text = insert.contents;
+                        if (insert.before) {
+                            try self.pattern_space.insert(0, '\n');
+                            try self.pattern_space.insertSlice(0, text);
+                        } else {
+                            try self.pattern_space.appendSlice(text);
+                        }
                     },
                     .to_hold => |h| {
                         if (h) {
@@ -650,6 +676,9 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
                         }
                         try self.pattern_space.appendSlice(self.hold_space.items);
                     },
+                    .exchange => {
+                        mem.swap(std.ArrayList(u8), &self.pattern_space, &self.hold_space);
+                    },
                     .next_line => |n| {
                         if (!self.in_stream.isLastLine()) {
                             if (n) {
@@ -666,7 +695,7 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
                                 try self.printPatternSpace();
                             }
                             // http://sed.sourceforge.net/sedfaq6.html#s6.7.5
-                            if (self.opts.posix_quit) {
+                            if (n or self.opts.posix_quit) {
                                 return error.QuitCommand;
                             }
                         }
@@ -690,7 +719,9 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
                         };
                         if (has_match) {
                             // do the replacement in the basement
-                            const the_slice = try Pcre.replace(s.regex, subject, match_it.ovector.?[0], s.repl, self.pattern_space.items, .{
+                            const offset = std.math.min(match_it.ovector.?[0], subject.len); // TODO: find out how to actually use ovector
+                            //std.debug.print("STARTING {d} at {s}\n", .{ offset, subject });
+                            const the_slice = try Pcre.replace(s.regex, subject, offset, s.repl, self.pattern_space.items, .{
                                 .bits = if (s.flags.global) Pcre.pcre2.PCRE2_SUBSTITUTE_GLOBAL else 0,
                                 .data_opt = match_data,
                             });

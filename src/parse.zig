@@ -3,7 +3,7 @@ const Pcre = @import("pcre2zig");
 const Regex = Pcre.CompiledCode;
 const mem = std.mem;
 
-pub const Command = enum { substitute, print, delete, insert, to_hold, to_pattern, quit, translate, group, label, jump, sentinel };
+pub const Command = enum { substitute, print, delete, insert, to_hold, to_pattern, next_line, quit, translate, group, jump, tmp_jump };
 
 pub const AddressKind = union(enum) {
     Regex: Regex,
@@ -22,21 +22,31 @@ pub const SedInstruction = struct {
         to_hold: bool, // if true: copy instead of append
         to_pattern: bool,
         substitute: struct {
-            regex: Regex,
+            regex: Regex, //
             repl: []const u8,
+            flags: SubstituteFlags = .{},
         }, // s/a/b/
-        print: void,
+        print: bool,
         delete: bool, // d - true; D - false
-        sentinel: void,
+        next_line: bool,
         quit: void,
-        group: []SedInstruction,
+        group: usize,
         translate: struct {
             from: []u21,
             to: []u21,
         },
-        jump: void,
-        label: void,
+        jump: usize,
+        tmp_jump: struct {
+            label: []const u8,
+            declared: usize,
+        },
     },
+};
+
+const SubstituteFlags = struct {
+    global: bool = false,
+    print: bool = false,
+    nth: ?u8 = null,
 };
 
 pub fn LineFeeder(comptime Source: type) type {
@@ -104,18 +114,38 @@ pub fn LineFeeder(comptime Source: type) type {
     };
 }
 
-pub const GeneratorError = error{ Unterminated, OutOfMemory, UnknownCommand, ExpectedAddress, UnmatchedBraces } || Pcre.PcreError;
+pub const GeneratorError = error{ Unterminated, OutOfMemory, UnknownCommand, ExpectedAddress, ExpectedCommand, UnmatchedBraces, ReusedLabel, UndefinedLabel, EmptyLabel } || Pcre.PcreError;
+
+const LabelHashMap = std.StringHashMap(usize);
 
 pub const Generator = struct {
     buf: []const u8,
     index: usize = 0,
     group_level: usize = 0,
-    alloc: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    _program: []SedInstruction,
+    labels: LabelHashMap,
 
     const Self = @This();
 
-    pub fn init(alloc: mem.Allocator, script: []const u8) Self {
-        return .{ .alloc = alloc, .buf = script };
+    pub fn init(alloc: mem.Allocator, script: []const u8, error_offset: *usize) !Self {
+        var ret = Self{ .arena = std.heap.ArenaAllocator.init(alloc), .labels = LabelHashMap.init(alloc), .buf = script, ._program = undefined };
+        errdefer {
+            ret.deinit();
+            error_offset.* = ret.index;
+        }
+        ret._program = try ret.work();
+        try ret.initializeJumps();
+        return ret;
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.labels.deinit();
+        self.arena.deinit();
+    }
+
+    pub fn program(self: *Self) []SedInstruction {
+        return self._program;
     }
 
     fn peekChar(self: *Self) ?u8 {
@@ -151,29 +181,70 @@ pub const Generator = struct {
     }
 
     fn nextArg(self: *Self, delim: u8) ![]const u8 {
-        var seen_backslash = false;
-        var list = std.ArrayList(u8).init(self.alloc);
+        var seen_bl = false;
+        var list = std.ArrayList(u8).init(self.arena.allocator());
         while (self.nextChar()) |b| {
-            if (b == delim) {
-                if (seen_backslash) {
-                    // pop the backslash and go on
+            if (seen_bl) {
+                if (b == '\n' or b == delim) {
                     _ = list.pop();
-                } else {
+                }
+                try list.append(b);
+                seen_bl = false;
+            } else {
+                if (b == delim) {
                     // return slice
                     return list.toOwnedSlice();
-                }
-            }
-            if (b == '\n') {
-                if (seen_backslash) {
-                    // literal newline escaped :D
-                    _ = list.pop();
-                } else {
-                    // unterminated argument lists, in my sed?
+                } else if (b == '\n') {
                     return error.Unterminated;
                 }
+                seen_bl = b == '\\';
+                try list.append(b);
             }
-            try list.append(b);
-            seen_backslash = b == '\\';
+        } else {
+            return error.Unterminated;
+        }
+    }
+
+    // translates ye olde sed matches into PCRE
+    fn pcreArg(self: *Self, delim: u8) ![]const u8 {
+        var seen_bl = false;
+        var list = std.ArrayList(u8).init(self.arena.allocator());
+        while (self.nextChar()) |b| {
+            if (seen_bl) {
+                switch (b) {
+                    '0'...'9' => {
+                        try list.appendSlice("${");
+                        try list.append(b);
+                        try list.append('}');
+                    },
+                    '{' => {
+                        try list.appendSlice("${");
+                        while (self.nextChar()) |b2| {
+                            switch (b2) {
+                                '}' => break,
+                                else => try list.append(b2),
+                            }
+                        } else return error.Unterminated;
+                        try list.append('}');
+                    },
+                    else => {
+                        if (b == '$') try list.append('$');
+                        try list.append(b);
+                    },
+                }
+                seen_bl = false;
+            } else {
+                if (b == delim) {
+                    return list.toOwnedSlice();
+                }
+                switch (b) {
+                    '&' => try list.appendSlice("${0}"),
+                    '$' => try list.appendSlice("$$"),
+                    '\\' => seen_bl = true,
+                    else => try list.append(b),
+                }
+                seen_bl = b == '\\';
+            }
         } else {
             return error.Unterminated;
         }
@@ -181,7 +252,7 @@ pub const Generator = struct {
 
     fn nextText(self: *Self) ![]const u8 {
         var seen_bl = false;
-        var list = std.ArrayList(u8).init(self.alloc);
+        var list = std.ArrayList(u8).init(self.arena.allocator());
         while (true) {
             const b = self.nextChar() orelse '\n';
             if (b == '\n') {
@@ -194,6 +265,19 @@ pub const Generator = struct {
             try list.append(b);
             seen_bl = b == '\\';
         }
+    }
+
+    fn nextLabel(self: *Self) ![]const u8 {
+        var list = std.ArrayList(u8).init(self.arena.allocator());
+        while (self.nextChar()) |b| switch (b) {
+            '\n', ';', ' ', '\t' => {
+                self.index -= 1;
+                break;
+            },
+            else => try list.append(b),
+        };
+        if (list.items.len == 0) return error.EmptyLabel;
+        return list.toOwnedSlice();
     }
 
     fn nextOption(self: *Self) !?u8 {
@@ -229,126 +313,189 @@ pub const Generator = struct {
         return false;
     }
 
-    pub fn makeCommand(self: *Self) GeneratorError!?SedInstruction {
-        var ret = SedInstruction{ .cmd = .sentinel };
-
-        self.skipWhitespace();
-        while (self.peekChar() == @as(u8, '#')) {
-            self.comment();
+    fn work(self: *Self) GeneratorError![]SedInstruction {
+        var output = std.ArrayList(SedInstruction).init(self.arena.allocator());
+        while (true) {
+            var ret = SedInstruction{ .cmd = .{ .tmp_jump = undefined } };
             self.skipWhitespace();
-        }
-
-        var inline_for_break = false;
-        inline for (.{ "address1", "address2" }) |addr_field| {
-            if (!inline_for_break) {
-                if (try self.nextNumber()) |line_addr| {
-                    @field(ret, addr_field) = .{ .kind = .{ .Line = line_addr }, .invert = try self.maybeInvert() };
-                } else switch (self.nextChar() orelse return null) {
-                    '/' => {
-                        const r = try self.nextArg('/');
-                        const invert = try self.maybeInvert();
-                        @field(ret, addr_field) = .{ .kind = .{ .Regex = try Pcre.compile(r, .{}) }, .invert = invert };
-                    },
-                    '\\' => {
-                        const r = try self.nextArg(try self.getDelim());
-                        const invert = try self.maybeInvert();
-                        @field(ret, addr_field) = .{ .kind = .{ .Regex = try Pcre.compile(r, .{}) }, .invert = invert };
-                    },
-                    '$' => {
-                        @field(ret, addr_field) = .{ .kind = .{ .LastLine = {} }, .invert = try self.maybeInvert() };
-                    },
-                    else => {
-                        if (inline_for_break) {
-                            return error.ExpectedAddress;
-                        } else {
-                            self.index -= 1;
-                        }
-                    },
-                }
+            while (self.peekChar() == @as(u8, '#')) {
+                self.comment();
                 self.skipWhitespace();
-                if (self.peekChar() == @as(u8, ',')) {
-                    self.index += 1;
-                } else {
-                    // break; https://github.com/ziglang/zig/issues/11606
-                    inline_for_break = true;
+            }
+
+            var inline_for_break = false;
+            inline for (.{ "address1", "address2" }) |addr_field, i| {
+                if (!inline_for_break) {
+                    if (try self.nextNumber()) |line_addr| {
+                        @field(ret, addr_field) = .{ .kind = .{ .Line = line_addr }, .invert = try self.maybeInvert() };
+                    } else switch (self.nextChar() orelse return output.toOwnedSlice()) {
+                        '/' => {
+                            const r = try self.nextArg('/');
+                            const invert = try self.maybeInvert();
+                            @field(ret, addr_field) = .{ .kind = .{ .Regex = try Pcre.compile(r, .{}) }, .invert = invert };
+                        },
+                        '\\' => {
+                            const r = try self.nextArg(try self.getDelim());
+                            const invert = try self.maybeInvert();
+                            @field(ret, addr_field) = .{ .kind = .{ .Regex = try Pcre.compile(r, .{}) }, .invert = invert };
+                        },
+                        '$' => {
+                            @field(ret, addr_field) = .{ .kind = .{ .LastLine = {} }, .invert = try self.maybeInvert() };
+                        },
+                        else => {
+                            if (i != 0) {
+                                return error.ExpectedAddress;
+                            } else {
+                                self.index -= 1;
+                            }
+                        },
+                    }
+                    self.skipWhitespace();
+                    if (self.peekChar() == @as(u8, ',')) {
+                        self.index += 1;
+                    } else {
+                        // break; https://github.com/ziglang/zig/issues/11606
+                        inline_for_break = true;
+                    }
                 }
             }
+
+            self.skipWhitespace();
+
+            const cmd = self.nextChar() orelse break;
+            const isL = std.ascii.isLower;
+            switch (cmd) {
+                '{' => {
+                    const my_level = self.group_level;
+                    self.group_level += 1;
+                    const group_cmds = try self.work();
+                    if (my_level != self.group_level) return error.UnmatchedBraces;
+                    defer self.arena.allocator().free(group_cmds);
+                    ret.cmd = .{ .group = group_cmds.len };
+                    // append, we're going to skip
+                    try output.append(ret);
+                    try output.appendSlice(group_cmds);
+                    continue; // no semicolons needed
+                },
+                '}' => return error.ExpectedCommand,
+                'p', 'P' => ret.cmd = .{ .print = isL(cmd) },
+                'd', 'D' => ret.cmd = .{ .delete = isL(cmd) },
+                'q' => ret.cmd = .quit,
+                'i' => {
+                    ret.cmd = .{ .insert = try self.nextText() };
+                },
+                's' => {
+                    const delim = try self.getDelim();
+                    const regex = try Pcre.compile(try self.nextArg(delim), .{});
+                    const repl = try self.pcreArg(delim);
+                    var opts = SubstituteFlags{};
+                    while (self.nextChar()) |opt| switch (opt) {
+                        'g' => opts.global = true,
+                        'p' => opts.print = true,
+                        '0'...'9' => opts.nth = opt - '0',
+                        else => {
+                            self.index -= 1;
+                            break;
+                        },
+                    };
+                    ret.cmd = .{ .substitute = .{
+                        .regex = regex,
+                        .repl = repl,
+                        .flags = opts,
+                    } };
+                },
+                'h' => ret.cmd = .{ .to_hold = true },
+                'H' => ret.cmd = .{ .to_hold = false },
+                'g' => ret.cmd = .{ .to_pattern = true },
+                'G' => ret.cmd = .{ .to_pattern = false },
+                'n' => ret.cmd = .{ .next_line = true },
+                'N' => ret.cmd = .{ .next_line = false },
+                ':' => {
+                    const label = try self.nextLabel();
+                    var label_entry = try self.labels.getOrPut(label);
+                    if (label_entry.found_existing) {
+                        return error.ReusedLabel;
+                    }
+                    label_entry.value_ptr.* = output.items.len;
+                    continue; // no semicolon and no instruction output needed
+                },
+                'b' => {
+                    const decl = self.index;
+                    const label = try self.nextLabel();
+                    if (self.labels.get(label)) |pos| {
+                        ret.cmd = .{ .jump = pos };
+                    } else {
+                        // a promise
+                        ret.cmd = .{ .tmp_jump = .{
+                            .label = label,
+                            .declared = decl,
+                        } };
+                    }
+                },
+                '\n', ';' => {
+                    if (ret.address1 == null) {
+                        continue;
+                    } else {
+                        return error.ExpectedCommand;
+                    }
+                },
+                else => {
+                    std.log.err("Unknown command: '{c}'", .{cmd});
+                    return error.UnknownCommand;
+                },
+            }
+
+            self.skipWhitespace();
+
+            // look for a closure
+            const semicolon = self.nextChar() orelse {
+                try output.append(ret);
+                break;
+            };
+            switch (semicolon) {
+                '\n', ';' => try output.append(ret),
+                '}' => {
+                    if (self.group_level == 0) {
+                        return error.UnmatchedBraces;
+                    }
+                    self.group_level -= 1;
+                    return output.toOwnedSlice();
+                },
+                else => {
+                    std.log.err("Expected {{, ; or newline, got {c}", .{semicolon});
+                    return error.Unterminated;
+                },
+            }
         }
-
-        self.skipWhitespace();
-
-        const cmd = self.nextChar() orelse return null;
-        switch (cmd) {
-            '{' => {
-                const my_level = self.group_level;
-                self.group_level += 1;
-                var commands = std.ArrayList(SedInstruction).init(self.alloc);
-                while (self.group_level > my_level) {
-                    const made_cmd = try self.makeCommand();
-                    try commands.append(made_cmd orelse return error.UnmatchedBraces);
-                }
-                ret.cmd = .{ .group = commands.toOwnedSlice() };
-                return ret; // no semicolons needed
-            },
-            '}' => return error.UnmatchedBraces,
-            'p' => ret.cmd = .print,
-            'd' => ret.cmd = .{ .delete = true },
-            'D' => ret.cmd = .{ .delete = false },
-            'q' => ret.cmd = .quit,
-            'i' => {
-                ret.cmd = .{ .insert = try self.nextText() };
-            },
-            's' => {
-                const delim = try self.getDelim();
-                const regex = try Pcre.compile(try self.nextArg(delim), .{});
-                const repl = try self.nextArg(delim);
-                ret.cmd = .{ .substitute = .{
-                    .regex = regex,
-                    .repl = repl,
-                } };
-            },
-            'h' => ret.cmd = .{ .to_hold = true },
-            'H' => ret.cmd = .{ .to_hold = false },
-            'g' => ret.cmd = .{ .to_pattern = true },
-            'G' => ret.cmd = .{ .to_pattern = false },
-            '\n', ';' => {},
-            else => {
-                std.log.err("Unknown command: '{c}'", .{cmd});
-                return error.UnknownCommand;
-            },
-        }
-
-        self.skipWhitespace();
-
-        // look for a closure
-        switch (self.nextChar() orelse return ret) {
-            '\n', ';' => return ret,
-            '}' => {
-                if (self.group_level == 0) {
-                    return error.UnmatchedBraces;
-                }
-                self.group_level -= 1;
-                return ret;
-            },
-            else => return error.Unterminated,
-        }
+        if (self.group_level != 0) return error.UnmatchedBraces;
+        return output.toOwnedSlice();
     }
 
-    pub fn work(self: *Self) ![]SedInstruction {
-        var program = std.ArrayList(SedInstruction).init(self.alloc);
-        while (try self.makeCommand()) |cmd| {
-            try program.append(cmd);
-        } else {
-            return if (self.group_level == 0) program.toOwnedSlice() else error.UnmatchedBraces;
-        }
+    fn initializeJumps(self: *Self) !void {
+        for (self._program) |*instr| switch (instr.cmd) {
+            .tmp_jump => |jmp| {
+                if (self.labels.get(jmp.label)) |pos| {
+                    instr.cmd = .{ .jump = pos };
+                } else {
+                    self.index = jmp.declared;
+                    return error.UndefinedLabel;
+                }
+            },
+            else => {},
+        };
     }
+};
+
+pub const RunnerOptions = struct {
+    print: bool = true,
+    posix_quit: bool = false,
 };
 
 pub fn Runner(comptime Source: type, comptime Writer: type) type {
     return struct {
         in_stream: LineFeeder(Source),
         out_stream: Writer,
-        print: bool = true,
+        opts: RunnerOptions = .{},
         alloc: std.mem.Allocator,
         input: []SedInstruction,
         pattern_space: std.ArrayList(u8),
@@ -360,7 +507,7 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
         const Self = @This();
         const buf_size = 1 << 16; //max size for stream operations
 
-        pub fn init(cleanup: fn (Source) void, out_stream: Writer, alloc: std.mem.Allocator, instructions: []SedInstruction, print: bool) Self {
+        pub fn init(cleanup: fn (Source) void, out_stream: Writer, alloc: std.mem.Allocator, instructions: []SedInstruction, opts: RunnerOptions) Self {
             return .{
                 .input = instructions,
                 .in_stream = LineFeeder(Source).init(alloc, cleanup),
@@ -369,11 +516,12 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
                 .next_line = std.ArrayList(u8).init(alloc),
                 .hold_space = std.ArrayList(u8).init(alloc),
                 .alloc = alloc,
-                .print = print,
+                .opts = opts,
             };
         }
 
         pub fn deinit(self: *Self) void {
+            self.in_stream.deinit();
             self.pattern_space.deinit();
             self.hold_space.deinit();
             self.next_line.deinit();
@@ -389,16 +537,6 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
 
         fn printPatternSpace(self: *Self) !void {
             self.out_stream.print("{s}\n", .{self.pattern_space.items}) catch return error.IOError;
-        }
-
-        fn performReplacement(self: *Self, r: Regex, repl: []const u8, global: bool) !void {
-            _ = global;
-            const subject = self.pattern_space.toOwnedSlice();
-            defer self.alloc.free(subject);
-            try self.pattern_space.ensureUnusedCapacity(1 << 16);
-            self.pattern_space.expandToCapacity();
-            const the_slice = try Pcre.replace(r, subject, 0, repl, self.pattern_space.items, .{});
-            self.pattern_space.shrinkRetainingCapacity(the_slice.len);
         }
 
         fn matchAddress(self: *Self, a: ?Address) !bool {
@@ -418,11 +556,17 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
         const RunError = Pcre.PcreError || error{ OutOfMemory, DeleteCommand, QuitCommand, NotImplemented, IOError };
         fn runInstructions(self: *Self, input: []SedInstruction) RunError!void {
             var i: usize = 0;
-            while (i < input.len) : (i += 1) {
+            while (i < input.len) { // no : (i += 1) because of jumps
                 var item = &input[i];
+                // skip groups
+                defer switch (item.cmd) {
+                    .group => |g| i += g,
+                    else => {},
+                };
 
                 if (!(item.found_first or try self.matchAddress(item.address1))) {
                     item.found_first = false;
+                    i += 1;
                     continue;
                 }
 
@@ -441,13 +585,22 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
 
                 switch (item.cmd) {
                     .quit => return error.QuitCommand,
-                    .print => try self.printPatternSpace(),
+                    .print => |p| {
+                        if (p) {
+                            try self.printPatternSpace();
+                        } else {
+                            self.out_stream.print("{s}\n", .{mem.sliceTo(self.pattern_space.items, '\n')}) catch return error.IOError;
+                        }
+                    },
                     .delete => |d| {
                         if (d) {
                             return error.DeleteCommand;
                         } else {
                             if (mem.indexOfScalar(u8, self.pattern_space.items, '\n')) |newline| {
                                 try self.pattern_space.replaceRange(0, newline, &.{});
+                                // would be more fun to tail but https://github.com/ziglang/zig/issues/5692
+                                i = 0;
+                                continue;
                             } else {
                                 return error.DeleteCommand;
                             }
@@ -458,21 +611,89 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
                         try self.pattern_space.insertSlice(0, text);
                     },
                     .to_hold => |h| {
-                        if (h) self.hold_space.clearRetainingCapacity();
+                        if (h) {
+                            self.hold_space.clearRetainingCapacity();
+                        } else {
+                            try self.hold_space.append('\n');
+                        }
                         try self.hold_space.appendSlice(self.pattern_space.items);
                     },
                     .to_pattern => |g| {
-                        if (g) self.pattern_space.clearRetainingCapacity();
+                        if (g) {
+                            self.pattern_space.clearRetainingCapacity();
+                        } else {
+                            try self.pattern_space.append('\n');
+                        }
                         try self.pattern_space.appendSlice(self.hold_space.items);
                     },
-                    .substitute => |s| self.performReplacement(s.regex, s.repl, false) catch continue,
-                    .group => |g| try self.runInstructions(g),
-                    .sentinel => {
-                        std.log.err("Invalid instruction, file a bug", .{});
+                    .next_line => |n| {
+                        if (!self.in_stream.isLastLine()) {
+                            if (n) {
+                                if (self.opts.print) try self.printPatternSpace();
+                                self.pattern_space.clearRetainingCapacity();
+                            } else {
+                                try self.pattern_space.append('\n');
+                            }
+                            const l = (self.in_stream.next() catch return error.IOError) orelse unreachable;
+                            defer self.alloc.free(l);
+                            try self.pattern_space.appendSlice(l);
+                        } else {
+                            if (n and self.opts.print) {
+                                try self.printPatternSpace();
+                            }
+                            // http://sed.sourceforge.net/sedfaq6.html#s6.7.5
+                            if (self.opts.posix_quit) {
+                                return error.QuitCommand;
+                            }
+                        }
+                    },
+                    .substitute => |s| {
+                        const subject = self.pattern_space.toOwnedSlice();
+                        defer self.alloc.free(subject);
+                        try self.pattern_space.ensureUnusedCapacity(buf_size);
+                        self.pattern_space.expandToCapacity();
+                        // Query for matches.
+                        var match_data = try Pcre.MatchData.init(s.regex);
+                        defer match_data.deinit();
+                        var match_it = Pcre.MatchIterator.init(s.regex, match_data, subject);
+                        const has_match = b: {
+                            var match_index: usize = 0;
+                            const expect = s.flags.nth orelse 0;
+                            while (try match_it.next()) : (match_index += 1) {
+                                if (match_index == expect) break :b true;
+                            }
+                            break :b false;
+                        };
+                        if (has_match) {
+                            // do the replacement in the basement
+                            const the_slice = try Pcre.replace(s.regex, subject, match_it.ovector.?[0], s.repl, self.pattern_space.items, .{
+                                .bits = if (s.flags.global) Pcre.pcre2.PCRE2_SUBSTITUTE_GLOBAL else 0,
+                                .data_opt = match_data,
+                            });
+                            // hide the uninitialized 640k
+                            self.pattern_space.shrinkRetainingCapacity(the_slice.len);
+                            // p option
+                            if (s.flags.print) {
+                                try self.printPatternSpace();
+                            }
+                        } else {
+                            // put it back
+                            self.pattern_space.clearRetainingCapacity();
+                            try self.pattern_space.appendSlice(subject);
+                        }
+                    },
+                    .group => {},
+                    .jump => |b| {
+                        i = b;
+                        continue;
+                    },
+                    .tmp_jump => {
+                        std.log.err("Uninitialized jump instruction, file a bug", .{});
                         std.os.exit(1);
                     },
                     else => return error.NotImplemented,
                 }
+                i += 1;
             }
         }
 
@@ -487,13 +708,13 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
                     error.DeleteCommand => continue,
                     else => return e,
                 };
-                if (self.print)
+                if (self.opts.print)
                     try self.printPatternSpace();
             }
         }
     };
 }
 
-pub fn runner(comptime Source: type, cleanup: fn (Source) void, out: anytype, a: std.mem.Allocator, i: []SedInstruction, print: bool) Runner(Source, @TypeOf(out)) {
-    return Runner(Source, @TypeOf(out)).init(cleanup, out, a, i, print);
+pub fn runner(comptime Source: type, cleanup: fn (Source) void, out: anytype, a: std.mem.Allocator, i: []SedInstruction, opts: RunnerOptions) Runner(Source, @TypeOf(out)) {
+    return Runner(Source, @TypeOf(out)).init(cleanup, out, a, i, opts);
 }

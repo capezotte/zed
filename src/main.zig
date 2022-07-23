@@ -1,5 +1,4 @@
 const sed = @import("./parse.zig");
-const SedError = sed.ScanError || sed.GenerationError;
 const std = @import("std");
 const clap = @import("clap");
 const fs = std.fs;
@@ -10,25 +9,19 @@ fn fileClose(f: fs.File) void {
     f.close();
 }
 
-fn scriptFromFixedBuffer(a: mem.Allocator, f: *sed.TokenFifo, src: []const u8) !void {
-    var script = io.fixedBufferStream(src).reader();
-    var scan = sed.scanner(script, a, f);
-    defer scan.deinit();
-    return scan.work();
-}
-
 pub fn main() !void {
     const params = comptime clap.parseParamsComptime(
         \\-n, --quiet  Whether to automatically print the transformed lines.
         \\-e, --expression <script>...  Command line argument that is evalued as a sed script. Can be specified multiple times.
-        \\-f, --file <file>...        Files where scripts are sourced from.
+        \\-f, --file <file>...          Files where scripts are sourced from.
+        \\--posix                       Make N and n quit when no new lines are available.
         \\<file>...
         \\
     );
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .stack_trace_frames = 10 }){};
     var alloc = gpa.allocator();
-    // defer _ = alloc.deinit(); stupid dog you make me look bad
+    defer _ = gpa.deinit(); // stupid dog you make me look bad
     const parsers = comptime .{
         .script = clap.parsers.string,
         .file = clap.parsers.string,
@@ -62,25 +55,33 @@ pub fn main() !void {
         }
         break :b script.toOwnedSlice();
     };
+    defer alloc.free(script);
 
     const positionals = if (script_from_pos) res.positionals[1..] else res.positionals;
 
     var stdout = io.getStdOut().writer();
-    var gen = sed.Generator.init(alloc, script);
-    const instr = gen.work() catch |e| {
-        var line: usize = 0;
-        var line_start: usize = 0;
-        for (gen.buf[0..gen.index]) |c, i| {
-            if (c == '\n') {
-                line += 1;
-                line_start = i + 1;
+    var gen = b: {
+        var error_location: usize = undefined;
+        var gen = sed.Generator.init(alloc, script, &error_location) catch |e| {
+            var line: usize = 0;
+            var line_start: usize = 0;
+            for (script[0..error_location]) |c, i| {
+                if (c == '\n') {
+                    line += 1;
+                    line_start = i + 1;
+                }
             }
-        }
-        std.log.err("{} at line {}, pos {}.", .{ e, line, gen.index - line_start });
-        return e;
+            const line_offset = error_location - line_start;
+            std.log.err("{} at line {}, pos {}.", .{ e, line, line_offset });
+            std.log.err("{s}", .{mem.sliceTo(script[line_start..], '\n')});
+            std.log.err("{[empty]s: >[len]}^", .{ .empty = "", .len = line_offset });
+            return e;
+        };
+        break :b gen;
     };
+    defer gen.deinit();
 
-    var r = sed.runner(fs.File, fileClose, stdout, alloc, instr, !res.args.quiet);
+    var r = sed.runner(fs.File, fileClose, stdout, alloc, gen.program(), .{ .print = !res.args.quiet, .posix_quit = res.args.posix });
     defer r.deinit();
 
     for (positionals) |p| {

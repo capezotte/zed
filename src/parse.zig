@@ -56,6 +56,7 @@ pub fn LineFeeder(comptime Source: type) type {
         alloc: mem.Allocator,
         lookahead: ?[]const u8 = null,
         cleanup: fn (Source) void,
+        _line: usize = 0,
         last: bool = false,
 
         const InFifoType = std.fifo.LinearFifo(Source, .Dynamic);
@@ -71,6 +72,10 @@ pub fn LineFeeder(comptime Source: type) type {
 
         pub fn deinit(self: *Self) void {
             self.fifo.deinit();
+        }
+
+        pub fn line(self: *Self) usize {
+            return self._line;
         }
 
         pub fn isLastLine(self: *Self) bool {
@@ -106,6 +111,7 @@ pub fn LineFeeder(comptime Source: type) type {
         pub fn next(self: *Self) !?[]const u8 {
             if (self.lookahead) |l| {
                 try self.lookAhead();
+                self._line += 1;
                 return l;
             } else {
                 return null;
@@ -459,6 +465,7 @@ pub const Generator = struct {
                         return error.UnmatchedBraces;
                     }
                     self.group_level -= 1;
+                    try output.append(ret);
                     return output.toOwnedSlice();
                 },
                 else => {
@@ -502,7 +509,6 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
         next_line: std.ArrayList(u8),
         hold_space: std.ArrayList(u8),
         last_line: bool = false,
-        index: usize = 0,
 
         const Self = @This();
         const buf_size = 1 << 16; //max size for stream operations
@@ -542,7 +548,7 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
         fn matchAddress(self: *Self, a: ?Address) !bool {
             if (a == null) return true;
             const ret = switch (a.?.kind) {
-                .Line => |l| self.index == l,
+                .Line => |l| self.in_stream.line() == l,
                 .LastLine => self.in_stream.isLastLine(),
                 .Regex => |r| {
                     var data = try Pcre.MatchData.init(r);
@@ -558,22 +564,22 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
             var i: usize = 0;
             while (i < input.len) { // no : (i += 1) because of jumps
                 var item = &input[i];
-                // skip groups
-                defer switch (item.cmd) {
-                    .group => |g| i += g,
-                    else => {},
-                };
+                i += 1;
 
                 if (!(item.found_first or try self.matchAddress(item.address1))) {
                     item.found_first = false;
-                    i += 1;
+                    // skip groups
+                    switch (item.cmd) {
+                        .group => |g| i += g,
+                        else => {},
+                    }
                     continue;
                 }
 
                 if (item.address2) |a2| {
-                    // Spec says if it matches a previous line, we must consider only the first pattern.
+                    // Spec says "if the second address is a number less than or equal to the line number first selected, only one line shall be selected."
                     const line_early = switch (a2.kind) {
-                        .Line => |l| l <= self.index and !a2.invert,
+                        .Line => |l| l <= self.in_stream.line() and !a2.invert,
                         else => false,
                     };
                     if (line_early or (item.found_first and try self.matchAddress(a2))) {
@@ -693,13 +699,11 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
                     },
                     else => return error.NotImplemented,
                 }
-                i += 1;
             }
         }
 
         pub fn run(self: *Self) !void {
             while (try self.in_stream.next() catch error.IOError) |l| {
-                self.index += 1;
                 defer self.alloc.free(l);
                 self.pattern_space.clearRetainingCapacity();
                 try self.pattern_space.appendSlice(l);

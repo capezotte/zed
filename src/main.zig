@@ -26,62 +26,61 @@ pub fn main() !void {
         \\
     );
 
-    var alloc = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var alloc = gpa.allocator();
     // defer _ = alloc.deinit(); stupid dog you make me look bad
-    var fifo = sed.TokenFifo.init(alloc.allocator());
-    defer fifo.deinit();
     const parsers = comptime .{
         .script = clap.parsers.string,
         .file = clap.parsers.string,
     };
     var res = try clap.parse(clap.Help, &params, parsers, .{});
-    var files = std.fifo.LinearFifo(fs.File, .Dynamic).init(alloc.allocator());
+    defer res.deinit();
+    var files = std.fifo.LinearFifo(fs.File, .Dynamic).init(alloc);
     defer files.deinit();
     // Script Get
-    var got_script = false;
-    defer res.deinit();
-    for (res.args.expression) |expr, i| {
-        scriptFromFixedBuffer(alloc.allocator(), &fifo, expr) catch |e| {
-            std.log.err("error in expression #{d} ({s})", .{ i + 1, expr });
-            return e;
-        };
-        got_script = true;
-    }
-
-    for (res.args.file) |f, i| {
-        var scriptFile = try fs.cwd().openFile(f, .{});
-        defer scriptFile.close();
-        var r = scriptFile.reader();
-        var scan = sed.scanner(r, alloc.allocator(), &fifo);
-        defer scan.deinit();
-        scan.work() catch |e| {
-            std.log.err("error in file #{}", .{i + 1});
-            return e;
-        };
-        got_script = true;
-    }
-
-    const positionals = if (!got_script) b: {
-        if (res.positionals.len > 0) {
-            scriptFromFixedBuffer(alloc.allocator(), &fifo, res.positionals[0]) catch |e| {
-                std.log.err("error in first argument", .{});
-                return e;
-            };
-            got_script = true;
-            break :b res.positionals[1..];
-        } else {
-            return clap.help(std.io.getStdErr().writer(), clap.Help, &params, .{});
+    var script_from_pos = false;
+    var script = b: {
+        var script = std.ArrayList(u8).init(alloc);
+        for (res.args.expression) |expr| {
+            try script.appendSlice(expr);
+            try script.append('\n');
         }
-    } else res.positionals;
+        for (res.args.file) |f| {
+            var script_file = try fs.cwd().openFile(f, .{});
+            defer script_file.close();
+            try script_file.reader().readAllArrayList(&script, 1 << 16);
+            try script.append('\n');
+        }
+        if (script.items.len == 0 and res.positionals.len > 0) {
+            try script.appendSlice(res.positionals[0]);
+            try script.append('\n');
+            script_from_pos = true;
+        }
+        if (script.items.len == 0) {
+            try clap.help(std.io.getStdErr().writer(), clap.Help, &params, .{});
+            return;
+        }
+        break :b script.toOwnedSlice();
+    };
 
-    var gen = sed.Generator.init(alloc.allocator(), &fifo);
-    try gen.work();
+    const positionals = if (script_from_pos) res.positionals[1..] else res.positionals;
 
     var stdout = io.getStdOut().writer();
-    const instr = gen.finish();
-    defer alloc.allocator().free(instr);
+    var gen = sed.Generator.init(alloc, script);
+    const instr = gen.work() catch |e| {
+        var line: usize = 0;
+        var line_start: usize = 0;
+        for (gen.buf[0..gen.index]) |c, i| {
+            if (c == '\n') {
+                line += 1;
+                line_start = i + 1;
+            }
+        }
+        std.log.err("{} at line {}, pos {}.", .{ e, line, gen.index - line_start });
+        return e;
+    };
 
-    var r = sed.runner(fs.File, fileClose, stdout, alloc.allocator(), instr, !res.args.quiet);
+    var r = sed.runner(fs.File, fileClose, stdout, alloc, instr, !res.args.quiet);
     defer r.deinit();
 
     for (positionals) |p| {

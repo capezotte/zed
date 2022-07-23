@@ -3,7 +3,7 @@ const Pcre = @import("pcre2zig");
 const Regex = Pcre.CompiledCode;
 const mem = std.mem;
 
-pub const Command = enum { substitute, print, insert, quit, translate, group, label, sentinel };
+pub const Command = enum { substitute, print, insert, quit, translate, group, label, jump, sentinel };
 
 pub const AddressKind = union(enum) {
     Regex: Regex,
@@ -13,19 +13,28 @@ pub const AddressKind = union(enum) {
 
 pub const Address = struct { invert: bool, kind: AddressKind };
 
-pub const Token = union(enum) {
-    Address: Address,
-    Command: Command,
-    Argument: []const u8,
-    Option: u8,
-    Comma,
-    Not,
-    BeginGroup,
-    EndGroup,
-    Semicolon,
+pub const SedInstruction = struct {
+    address1: ?Address = null,
+    address2: ?Address = null,
+    found_first: bool = false,
+    cmd: union(Command) {
+        insert: []const u8, // itext
+        substitute: struct {
+            regex: Regex,
+            repl: []const u8,
+        }, // s/a/b/
+        print: void,
+        sentinel: void,
+        quit: void,
+        group: []SedInstruction,
+        translate: struct {
+            from: []u21,
+            to: []u21,
+        },
+        jump: void,
+        label: void,
+    },
 };
-
-pub const TokenFifo = std.fifo.LinearFifo(Token, .Dynamic);
 
 pub fn LineFeeder(comptime Source: type) type {
     return struct {
@@ -92,366 +101,234 @@ pub fn LineFeeder(comptime Source: type) type {
     };
 }
 
-pub fn Scanner(comptime Reader: type) type {
-    return struct {
-        stream: Reader,
-        list: std.ArrayList(u8),
-        alloc: std.mem.Allocator,
-        output: *TokenFifo,
-        char_lookahead: ?u8 = null,
-
-        const Self = @This();
-
-        pub fn init(the_stream: Reader, alloc: mem.Allocator, out: *TokenFifo) Self {
-            return .{ .stream = the_stream, .alloc = alloc, .list = std.ArrayList(u8).init(alloc), .output = out };
-        }
-
-        pub fn deinit(self: *Self) void {
-            self.list.deinit();
-        }
-
-        fn nextChar(self: *Self) !?u8 {
-            if (self.char_lookahead) |c| {
-                self.char_lookahead = null;
-                return c;
-            } else {
-                return self.stream.readByte() catch |err| switch (err) {
-                    error.EndOfStream => return null,
-                    else => return error.IOError,
-                };
-            }
-        }
-
-        fn nextCharU(self: *Self) !u8 {
-            return if (try self.nextChar()) |c| c else error.Unterminated;
-        }
-
-        fn getDelim(self: *Self) !u8 {
-            const ret = try self.nextCharU();
-            if (ret == '\n') {
-                return error.Unterminated;
-            }
-            return ret;
-        }
-
-        fn nextArg(self: *Self, delim: u8) ![]const u8 {
-            var seen_backslash = false;
-            while (true) {
-                const b = try self.nextCharU();
-                if (b == delim) {
-                    if (seen_backslash) {
-                        // pop the backslash and go on
-                        _ = self.list.pop();
-                    } else {
-                        // return slice
-                        return self.list.toOwnedSlice();
-                    }
-                }
-                if (b == '\n') {
-                    if (seen_backslash) {
-                        // literal newline escaped :D
-                        _ = self.list.pop();
-                    } else {
-                        // unterminated argument lists, in my sed?
-                        return error.Unterminated;
-                    }
-                }
-                try self.list.append(b);
-                seen_backslash = b == '\\';
-            }
-        }
-
-        fn nextText(self: *Self) ![]const u8 {
-            var seen_bl = false;
-            while (true) {
-                const b = (try self.nextChar()) orelse '\n';
-                if (b == '\n') {
-                    if (seen_bl) {
-                        _ = self.list.pop();
-                    } else {
-                        self.char_lookahead = '\n';
-                        return self.list.toOwnedSlice();
-                    }
-                }
-                try self.list.append(b);
-                seen_bl = b == '\\';
-            }
-        }
-
-        fn nextOption(self: *Self) !?u8 {
-            const b = (try self.nextChar()) orelse return null;
-            if (b == null or std.ascii.isAlpha(b)) {
-                return b;
-            } else {
-                self.char_lookahead = b;
-            }
-        }
-
-        fn maybeInvert(self: *Self) !bool {
-            const b = (try self.nextChar()) orelse return false;
-            if (b == '!') {
-                return true;
-            }
-            self.char_lookahead = b;
-            return false;
-        }
-
-        fn tokenOut(self: *Self, t: Token) !void {
-            try self.output.writeItem(t);
-        }
-
-        pub fn work(self: *Self) !void {
-            while (try self.nextChar()) |b| switch (b) {
-                '#' => {
-                    // comment: eat until newline
-                    while (((try self.nextChar()) orelse '\n') == '\n') {}
-                    try self.tokenOut(.{ .Semicolon = {} });
-                },
-                ' ', '\t' => {},
-                '/' => {
-                    const r = try self.nextArg('/');
-                    const invert = try self.maybeInvert();
-                    try self.tokenOut(.{ .Address = Address{ .kind = .{ .Regex = try Pcre.compile(r, .{}) }, .invert = invert } });
-                },
-                '\\' => {
-                    const r = try self.nextArg(try self.getDelim());
-                    const invert = try self.maybeInvert();
-                    try self.tokenOut(.{ .Address = Address{ .kind = .{ .Regex = try Pcre.compile(r, .{}) }, .invert = invert } });
-                },
-                '0'...'9' => {
-                    try self.list.append(b);
-                    while (true) {
-                        const new_b = (try self.nextChar()) orelse break;
-                        if (std.ascii.isDigit(new_b)) {
-                            try self.list.append(b);
-                        } else {
-                            self.char_lookahead = new_b;
-                            break;
-                        }
-                    }
-                    const ret = std.fmt.parseUnsigned(usize, self.list.items, 10) catch unreachable;
-                    self.list.clearAndFree();
-                    try self.tokenOut(.{ .Address = Address{ .kind = .{ .Line = ret }, .invert = try self.maybeInvert() } });
-                },
-                '$' => try self.tokenOut(.{ .Address = Address{ .kind = .{ .LastLine = {} }, .invert = try self.maybeInvert() } }),
-                '{' => try self.tokenOut(.{ .BeginGroup = {} }),
-                '}' => try self.tokenOut(.{ .EndGroup = {} }),
-                ',' => try self.tokenOut(.{ .Comma = {} }),
-                'p' => try self.tokenOut(.{ .Command = .print }),
-                'q' => try self.tokenOut(.{ .Command = .quit }),
-                'i' => {
-                    try self.tokenOut(.{ .Command = .insert });
-                    try self.tokenOut(.{ .Argument = try self.nextText() });
-                },
-                's' => {
-                    const delim = try self.getDelim();
-                    try self.tokenOut(Token{ .Command = .substitute });
-                    try self.tokenOut(Token{ .Argument = try self.nextArg(delim) });
-                    try self.tokenOut(Token{ .Argument = try self.nextArg(delim) });
-                },
-                'y' => {
-                    const delim = try self.getDelim();
-                    try self.tokenOut(Token{ .Command = .substitute });
-                    try self.tokenOut(Token{ .Argument = try self.nextArg(delim) });
-                    try self.tokenOut(Token{ .Argument = try self.nextArg(delim) });
-                },
-                ';', '\n' => try self.tokenOut(.{ .Semicolon = {} }),
-                else => return error.UnknownCommand,
-            };
-            try self.tokenOut(.{ .Semicolon = {} });
-        }
-    };
-}
-
-pub fn scanner(reader: anytype, a: std.mem.Allocator, f: *TokenFifo) Scanner(@TypeOf(reader)) {
-    return Scanner(@TypeOf(reader)).init(reader, a, f);
-}
-
-// TODO: refactor with unions instead of cursed optionals
-pub const SedInstruction = struct {
-    address1: ?Address = null,
-    address2: ?Address = null,
-    cmd: Command,
-    group: ?[]SedInstruction = null,
-    regex: ?Regex = null,
-    found_first: bool = false,
-    args: [5:null]?[]const u8 = [5:null]?[]const u8{ null, null, null, null, null },
-};
+pub const GeneratorError = error{ Unterminated, OutOfMemory, UnknownCommand, ExpectedAddress, UnmatchedBraces } || Pcre.PcreError;
 
 pub const Generator = struct {
-    input: *TokenFifo,
-    group_level: u16 = 0,
+    buf: []const u8,
+    index: usize = 0,
+    group_level: usize = 0,
     alloc: std.mem.Allocator,
-    output: std.ArrayList(SedInstruction),
 
-    pub fn init(alloc: std.mem.Allocator, inn: *TokenFifo) Generator {
-        return Generator{ .alloc = alloc, .input = inn, .output = std.ArrayList(SedInstruction).init(alloc) };
+    const Self = @This();
+
+    pub fn init(alloc: mem.Allocator, script: []const u8) Self {
+        return .{ .alloc = alloc, .buf = script };
     }
 
-    pub fn finish(self: *Generator) []SedInstruction {
-        return self.output.toOwnedSlice();
+    fn peekChar(self: *Self) ?u8 {
+        if (self.index >= self.buf.len) return null;
+        return self.buf[self.index];
     }
 
-    fn next(self: *Generator) !Token {
-        if (self.input.readItem()) |i| {
-            return i;
-        } else {
-            return error.EndOfFile;
-        }
-    }
-
-    fn argRun(self: *Generator, count: usize, out: *[5:null]?[]const u8) !void {
-        // assert(out < 5)
-        var i: usize = 0;
-        while (i < count) : (i += 1) {
-            switch (try self.next()) {
-                .Argument => |a| out[i] = a,
-                else => {
-                    std.log.err("Expected argument for command", .{});
-                    return error.UnexpectedToken;
-                },
-            }
-        }
-    }
-
-    fn groupLevel(self: *Generator, increase: bool) !void {
-        if (!increase) {
-            if (self.group_level == 0) {
-                return error.UnmatchedBraces;
-            }
-            self.group_level -= 1;
-        } else {
-            self.group_level += 1;
-        }
-    }
-
-    const AddressOrCommandRunError = error{ OutOfMemory, UnmatchedBraces, UnexpectedToken, IOError, EndOfFile, ExtraAddress } || Pcre.PcreError;
-
-    fn commandRun(self: *Generator, initial: ?Token) AddressOrCommandRunError!SedInstruction {
-        var ret = SedInstruction{ .cmd = .sentinel };
-        switch (initial orelse try self.next()) {
-            .Command => |c| {
-                ret.cmd = c;
-                switch (c) {
-                    .print, .quit => {},
-                    .substitute => {
-                        try self.argRun(2, &ret.args);
-                        ret.regex = try Pcre.compile(ret.args[0].?, .{});
-                    },
-                    .insert => try self.argRun(1, &ret.args),
-                    else => {
-                        std.log.err("Command not implemented", .{});
-                        return error.UnexpectedToken;
-                    },
-                }
-            },
-            .BeginGroup => {
-                ret.cmd = .group;
-                try self.groupLevel(true);
-                var command_buf = std.ArrayList(SedInstruction).init(self.alloc);
-                errdefer command_buf.deinit();
-                while (true) {
-                    const next_t = self.next() catch return error.UnmatchedBraces;
-                    switch (next_t) {
-                        .EndGroup => {
-                            try self.groupLevel(false);
-                            break;
-                        },
-                        .Address, .Command, .BeginGroup => {
-                            try command_buf.append((try self.addressOrCommandRun(next_t)) orelse unreachable);
-                        },
-                        .Semicolon => continue,
-                        else => return error.UnexpectedToken,
-                    }
-                }
-                ret.group = command_buf.toOwnedSlice();
-            },
-            .EndGroup => return error.UnmatchedBraces, // should only be reachable from the case above.
-            else => {
-                std.log.err("Expected command or {{", .{});
-                return error.UnexpectedToken;
-            },
-        }
-
-        // Look for a closure
-        const t = self.next() catch |e| switch (e) {
-            error.EndOfFile => return ret, // ok, equivalent to semicolon
-            else => return e,
-        };
-        switch (t) {
-            .Semicolon => {},
-            .EndGroup => {
-                // push back, see if who's calling us will handle it
-                // if not, it's an unmatched brace
-                try self.input.unget(&.{t});
-            },
-            else => {
-                std.log.err("Expected newline, semicolon", .{});
-                return error.UnexpectedToken;
-            },
-        }
+    fn nextChar(self: *Self) ?u8 {
+        const ret = self.peekChar();
+        self.index += 1;
         return ret;
     }
 
-    fn addressOrCommandRun(self: *Generator, initial: ?Token) AddressOrCommandRunError!?SedInstruction {
-        const t = initial orelse self.next() catch {
-            if (self.group_level == 0) {
-                return null;
-            } else {
-                return error.UnmatchedBraces;
-            }
+    fn skipWhitespace(self: *Self) void {
+        while (self.peekChar()) |c| switch (c) {
+            ' ', '\t', '\n' => self.index += 1,
+            else => return,
         };
+    }
 
-        switch (t) {
-            .Address => |a1| {
-                const t_a1 = try self.next();
-                switch (t_a1) {
-                    .Comma => {
-                        switch (try self.next()) {
-                            .Address => |a2| {
-                                var ret = try self.commandRun(null);
-                                ret.address1 = a1;
-                                ret.address2 = a2;
-                                switch (ret.cmd) {
-                                    // commands that don't accept two adresses
-                                    .label, .quit => return error.ExtraAddress,
-                                    else => {},
-                                }
-                                return ret;
-                            },
-                            else => {
-                                std.log.err("Expected address after comma", .{});
-                                return error.UnexpectedToken;
-                            },
-                        }
-                    },
-                    .Command, .BeginGroup => {
-                        var ret = try self.commandRun(t_a1);
-                        ret.address1 = a1;
-                        switch (ret.cmd) {
-                            .label => return error.ExtraAddress,
-                            else => {},
-                        }
-                        return ret;
-                    },
-                    else => {
-                        std.log.err("Expected comma or command after address", .{});
-                        return error.UnexpectedToken;
-                    },
-                }
-            },
-            .Command, .BeginGroup => return try self.commandRun(t),
-            .Semicolon => return try self.addressOrCommandRun(null), // basically skip
-            else => {
-                std.log.err("Expected address, command or semicolon", .{});
-                return error.UnexpectedToken;
-            },
+    fn comment(self: *Self) void {
+        while (true) {
+            const c = self.nextChar() orelse return;
+            if (c == '\n') {
+                return;
+            }
         }
     }
 
-    pub fn work(self: *Generator) !void {
-        while (try self.addressOrCommandRun(null)) |i| {
-            try self.output.append(i);
+    fn getDelim(self: *Self) !u8 {
+        const ret = self.nextChar() orelse return error.Unterminated;
+        return if (ret == '\n') error.Unterminated else ret;
+    }
+
+    fn nextArg(self: *Self, delim: u8) ![]const u8 {
+        var seen_backslash = false;
+        var list = std.ArrayList(u8).init(self.alloc);
+        while (self.nextChar()) |b| {
+            if (b == delim) {
+                if (seen_backslash) {
+                    // pop the backslash and go on
+                    _ = list.pop();
+                } else {
+                    // return slice
+                    return list.toOwnedSlice();
+                }
+            }
+            if (b == '\n') {
+                if (seen_backslash) {
+                    // literal newline escaped :D
+                    _ = list.pop();
+                } else {
+                    // unterminated argument lists, in my sed?
+                    return error.Unterminated;
+                }
+            }
+            try list.append(b);
+            seen_backslash = b == '\\';
+        } else {
+            return error.Unterminated;
+        }
+    }
+
+    fn nextText(self: *Self) ![]const u8 {
+        var seen_bl = false;
+        var list = std.ArrayList(u8).init(self.alloc);
+        while (true) {
+            const b = self.nextChar() orelse '\n';
+            if (b == '\n') {
+                if (seen_bl) {
+                    _ = list.pop();
+                } else {
+                    return list.toOwnedSlice();
+                }
+            }
+            try list.append(b);
+            seen_bl = b == '\\';
+        }
+    }
+
+    fn nextOption(self: *Self) !?u8 {
+        const b = self.nextChar() orelse return null;
+        if (b == null or std.ascii.isAlpha(b)) {
+            return b;
+        } else {
+            self.index -= 1;
+            return null;
+        }
+    }
+
+    fn nextNumber(self: *Self) !?usize {
+        const start = self.index;
+        while (self.peekChar()) |b| switch (b) {
+            '0'...'9' => self.index += 1,
+            else => break,
+        };
+        const end = self.index;
+        if (start == end) {
+            return null;
+        } else {
+            self.index -= 1;
+            return std.fmt.parseUnsigned(usize, self.buf[start..end], 10) catch unreachable;
+        }
+    }
+
+    fn maybeInvert(self: *Self) !bool {
+        const b = self.peekChar() orelse return false;
+        if (b == '!') {
+            self.index += 1;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn makeCommand(self: *Self) GeneratorError!?SedInstruction {
+        var ret = SedInstruction{ .cmd = .sentinel };
+
+        self.skipWhitespace();
+        while (self.peekChar() == @as(u8, '#')) {
+            self.comment();
+            self.skipWhitespace();
+        }
+
+        var inline_for_break = false;
+        inline for (.{ "address1", "address2" }) |addr_field| {
+            if (!inline_for_break) {
+                if (try self.nextNumber()) |line_addr| {
+                    @field(ret, addr_field) = .{ .kind = .{ .Line = line_addr }, .invert = try self.maybeInvert() };
+                } else switch (self.nextChar() orelse return null) {
+                    '/' => {
+                        const r = try self.nextArg('/');
+                        const invert = try self.maybeInvert();
+                        @field(ret, addr_field) = .{ .kind = .{ .Regex = try Pcre.compile(r, .{}) }, .invert = invert };
+                    },
+                    '\\' => {
+                        const r = try self.nextArg(try self.getDelim());
+                        const invert = try self.maybeInvert();
+                        @field(ret, addr_field) = .{ .kind = .{ .Regex = try Pcre.compile(r, .{}) }, .invert = invert };
+                    },
+                    '$' => {
+                        @field(ret, addr_field) = .{ .kind = .{ .LastLine = {} }, .invert = try self.maybeInvert() };
+                    },
+                    else => {
+                        if (inline_for_break) {
+                            return error.ExpectedAddress;
+                        } else {
+                            self.index -= 1;
+                        }
+                    },
+                }
+                self.skipWhitespace();
+                if (self.peekChar() == @as(u8, ',')) {
+                    self.index += 1;
+                } else {
+                    // break; https://github.com/ziglang/zig/issues/11606
+                    inline_for_break = true;
+                }
+            }
+        }
+
+        self.skipWhitespace();
+
+        const cmd = self.nextChar() orelse return null;
+        switch (cmd) {
+            '{' => {
+                const my_level = self.group_level;
+                self.group_level += 1;
+                var commands = std.ArrayList(SedInstruction).init(self.alloc);
+                while (self.group_level > my_level) {
+                    const made_cmd = try self.makeCommand();
+                    try commands.append(made_cmd orelse return error.UnmatchedBraces);
+                }
+                ret.cmd = .{ .group = commands.toOwnedSlice() };
+                return ret; // no semicolons needed
+            },
+            '}' => return error.UnmatchedBraces,
+            'p' => ret.cmd = .print,
+            'q' => ret.cmd = .quit,
+            'i' => {
+                ret.cmd = .{ .insert = try self.nextText() };
+            },
+            's' => {
+                const delim = try self.getDelim();
+                const regex = try Pcre.compile(try self.nextArg(delim), .{});
+                const repl = try self.nextArg(delim);
+                ret.cmd = .{ .substitute = .{
+                    .regex = regex,
+                    .repl = repl,
+                } };
+            },
+            '\n', ';' => {},
+            else => return error.UnknownCommand,
+        }
+
+        self.skipWhitespace();
+
+        // look for a closure
+        switch (self.nextChar() orelse return ret) {
+            '\n', ';' => return ret,
+            '}' => {
+                if (self.group_level == 0) {
+                    return error.UnmatchedBraces;
+                }
+                self.group_level -= 1;
+                return ret;
+            },
+            else => return error.Unterminated,
+        }
+    }
+
+    pub fn work(self: *Self) ![]SedInstruction {
+        var program = std.ArrayList(SedInstruction).init(self.alloc);
+        while (try self.makeCommand()) |cmd| {
+            try program.append(cmd);
+        } else {
+            return if (self.group_level == 0) program.toOwnedSlice() else error.UnmatchedBraces;
         }
     }
 };
@@ -554,12 +431,12 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
                 switch (item.cmd) {
                     .quit => return error.QuitCommand,
                     .print => try self.printPatternSpace(),
-                    .insert => {
+                    .insert => |text| {
                         try self.pattern_space.insert(0, '\n');
-                        try self.pattern_space.insertSlice(0, item.args[0].?);
+                        try self.pattern_space.insertSlice(0, text);
                     },
-                    .substitute => self.performReplacement(item.regex.?, item.args[1].?, false) catch continue,
-                    .group => try self.runInstructions(item.group.?),
+                    .substitute => |s| self.performReplacement(s.regex, s.repl, false) catch continue,
+                    .group => |g| try self.runInstructions(g),
                     .sentinel => {
                         std.log.err("Invalid instruction, file a bug", .{});
                         std.os.exit(1);

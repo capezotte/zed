@@ -3,7 +3,7 @@ const Pcre = @import("pcre2zig");
 const Regex = Pcre.CompiledCode;
 const mem = std.mem;
 
-pub const Command = enum { substitute, print, insert, quit, translate, group, label, jump, sentinel };
+pub const Command = enum { substitute, print, delete, insert, to_hold, to_pattern, quit, translate, group, label, jump, sentinel };
 
 pub const AddressKind = union(enum) {
     Regex: Regex,
@@ -19,11 +19,14 @@ pub const SedInstruction = struct {
     found_first: bool = false,
     cmd: union(Command) {
         insert: []const u8, // itext
+        to_hold: bool, // if true: copy instead of append
+        to_pattern: bool,
         substitute: struct {
             regex: Regex,
             repl: []const u8,
         }, // s/a/b/
         print: void,
+        delete: bool, // d - true; D - false
         sentinel: void,
         quit: void,
         group: []SedInstruction,
@@ -213,7 +216,6 @@ pub const Generator = struct {
         if (start == end) {
             return null;
         } else {
-            self.index -= 1;
             return std.fmt.parseUnsigned(usize, self.buf[start..end], 10) catch unreachable;
         }
     }
@@ -290,6 +292,8 @@ pub const Generator = struct {
             },
             '}' => return error.UnmatchedBraces,
             'p' => ret.cmd = .print,
+            'd' => ret.cmd = .{ .delete = true },
+            'D' => ret.cmd = .{ .delete = false },
             'q' => ret.cmd = .quit,
             'i' => {
                 ret.cmd = .{ .insert = try self.nextText() };
@@ -303,8 +307,15 @@ pub const Generator = struct {
                     .repl = repl,
                 } };
             },
+            'h' => ret.cmd = .{ .to_hold = true },
+            'H' => ret.cmd = .{ .to_hold = false },
+            'g' => ret.cmd = .{ .to_pattern = true },
+            'G' => ret.cmd = .{ .to_pattern = false },
             '\n', ';' => {},
-            else => return error.UnknownCommand,
+            else => {
+                std.log.err("Unknown command: '{c}'", .{cmd});
+                return error.UnknownCommand;
+            },
         }
 
         self.skipWhitespace();
@@ -404,7 +415,7 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
             if (a.?.invert) return !ret else return ret;
         }
 
-        const RunError = Pcre.PcreError || error{ OutOfMemory, QuitCommand, NotImplemented, IOError };
+        const RunError = Pcre.PcreError || error{ OutOfMemory, DeleteCommand, QuitCommand, NotImplemented, IOError };
         fn runInstructions(self: *Self, input: []SedInstruction) RunError!void {
             var i: usize = 0;
             while (i < input.len) : (i += 1) {
@@ -431,9 +442,28 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
                 switch (item.cmd) {
                     .quit => return error.QuitCommand,
                     .print => try self.printPatternSpace(),
+                    .delete => |d| {
+                        if (d) {
+                            return error.DeleteCommand;
+                        } else {
+                            if (mem.indexOfScalar(u8, self.pattern_space.items, '\n')) |newline| {
+                                try self.pattern_space.replaceRange(0, newline, &.{});
+                            } else {
+                                return error.DeleteCommand;
+                            }
+                        }
+                    },
                     .insert => |text| {
                         try self.pattern_space.insert(0, '\n');
                         try self.pattern_space.insertSlice(0, text);
+                    },
+                    .to_hold => |h| {
+                        if (h) self.hold_space.clearRetainingCapacity();
+                        try self.hold_space.appendSlice(self.pattern_space.items);
+                    },
+                    .to_pattern => |g| {
+                        if (g) self.pattern_space.clearRetainingCapacity();
+                        try self.pattern_space.appendSlice(self.hold_space.items);
                     },
                     .substitute => |s| self.performReplacement(s.regex, s.repl, false) catch continue,
                     .group => |g| try self.runInstructions(g),
@@ -453,7 +483,8 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
                 self.pattern_space.clearRetainingCapacity();
                 try self.pattern_space.appendSlice(l);
                 self.runInstructions(self.input) catch |e| switch (e) {
-                    error.QuitCommand => {},
+                    error.QuitCommand => return,
+                    error.DeleteCommand => continue,
                     else => return e,
                 };
                 if (self.print)

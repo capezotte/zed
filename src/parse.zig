@@ -1,9 +1,10 @@
 const std = @import("std");
 const Pcre = @import("pcre2zig");
 const Regex = Pcre.CompiledCode;
+const UnicodeView = std.unicode.Utf8View;
 const mem = std.mem;
 
-pub const Command = enum { substitute, print, delete, insert, to_hold, to_pattern, next_line, quit, translate, group, jump, tmp_jump };
+pub const Command = enum { substitute, print, delete, insert, to_hold, to_pattern, next_line, quit, translate, group, jump, tmp_jump, unambiguous_print, file };
 
 pub const AddressKind = union(enum) {
     Regex: Regex,
@@ -39,6 +40,11 @@ pub const SedInstruction = struct {
         tmp_jump: struct {
             label: []const u8,
             declared: usize,
+        },
+        unambiguous_print: void,
+        file: struct {
+            read: bool,
+            path: []const u8,
         },
     },
 };
@@ -120,7 +126,7 @@ pub fn LineFeeder(comptime Source: type) type {
     };
 }
 
-pub const GeneratorError = error{ Unterminated, OutOfMemory, UnknownCommand, ExpectedAddress, ExpectedCommand, UnmatchedBraces, ReusedLabel, UndefinedLabel, EmptyLabel } || Pcre.PcreError;
+pub const GeneratorError = error{ Unterminated, OutOfMemory, UnknownCommand, ExpectedAddress, ExpectedCommand, UnmatchedBraces, ReusedLabel, UndefinedLabel, EmptyLabel, InvalidUtf8 } || Pcre.PcreError;
 
 const LabelHashMap = std.StringHashMap(usize);
 
@@ -129,13 +135,15 @@ pub const Generator = struct {
     index: usize = 0,
     group_level: usize = 0,
     arena: std.heap.ArenaAllocator,
+    list: std.ArrayList(u8),
     _program: []SedInstruction,
     labels: LabelHashMap,
 
     const Self = @This();
 
     pub fn init(alloc: mem.Allocator, script: []const u8, error_offset: *usize) !Self {
-        var ret = Self{ .arena = std.heap.ArenaAllocator.init(alloc), .labels = LabelHashMap.init(alloc), .buf = script, ._program = undefined };
+        var ret = Self{ .arena = std.heap.ArenaAllocator.init(alloc), .list = undefined, .labels = LabelHashMap.init(alloc), .buf = script, ._program = undefined };
+        ret.list = std.ArrayList(u8).init(ret.arena.allocator());
         errdefer {
             ret.deinit();
             error_offset.* = ret.index;
@@ -147,6 +155,7 @@ pub const Generator = struct {
 
     pub fn deinit(self: *Self) void {
         self.labels.deinit();
+        self.list.deinit();
         self.arena.deinit();
     }
 
@@ -188,23 +197,22 @@ pub const Generator = struct {
 
     fn nextArg(self: *Self, delim: u8) ![]const u8 {
         var seen_bl = false;
-        var list = std.ArrayList(u8).init(self.arena.allocator());
         while (self.nextChar()) |b| {
             if (seen_bl) {
                 if (b == '\n' or b == delim) {
-                    _ = list.pop();
+                    _ = self.list.pop();
                 }
-                try list.append(b);
+                try self.list.append(b);
                 seen_bl = false;
             } else {
                 if (b == delim) {
                     // return slice
-                    return list.toOwnedSlice();
+                    return self.list.toOwnedSlice();
                 } else if (b == '\n') {
                     return error.Unterminated;
                 }
                 seen_bl = b == '\\';
-                try list.append(b);
+                try self.list.append(b);
             }
         } else {
             return error.Unterminated;
@@ -214,40 +222,39 @@ pub const Generator = struct {
     // translates ye olde sed matches into PCRE
     fn pcreArg(self: *Self, delim: u8) ![]const u8 {
         var seen_bl = false;
-        var list = std.ArrayList(u8).init(self.arena.allocator());
         while (self.nextChar()) |b| {
             if (seen_bl) {
                 switch (b) {
                     '0'...'9' => {
-                        try list.appendSlice("${");
-                        try list.append(b);
-                        try list.append('}');
+                        try self.list.appendSlice("${");
+                        try self.list.append(b);
+                        try self.list.append('}');
                     },
                     '{' => {
-                        try list.appendSlice("${");
+                        try self.list.appendSlice("${");
                         while (self.nextChar()) |b2| {
                             switch (b2) {
                                 '}' => break,
-                                else => try list.append(b2),
+                                else => try self.list.append(b2),
                             }
                         } else return error.Unterminated;
-                        try list.append('}');
+                        try self.list.append('}');
                     },
                     else => {
-                        if (b == '$') try list.append('$');
-                        try list.append(b);
+                        if (b == '$') try self.list.append('$');
+                        try self.list.append(b);
                     },
                 }
                 seen_bl = false;
             } else {
                 if (b == delim) {
-                    return list.toOwnedSlice();
+                    return self.list.toOwnedSlice();
                 }
                 switch (b) {
-                    '&' => try list.appendSlice("${0}"),
-                    '$' => try list.appendSlice("$$"),
+                    '&' => try self.list.appendSlice("${0}"),
+                    '$' => try self.list.appendSlice("$$"),
                     '\\' => seen_bl = true,
-                    else => try list.append(b),
+                    else => try self.list.append(b),
                 }
                 seen_bl = b == '\\';
             }
@@ -258,32 +265,30 @@ pub const Generator = struct {
 
     fn nextText(self: *Self) ![]const u8 {
         var seen_bl = false;
-        var list = std.ArrayList(u8).init(self.arena.allocator());
         while (true) {
             const b = self.nextChar() orelse '\n';
             if (b == '\n') {
                 if (seen_bl) {
-                    _ = list.pop();
+                    _ = self.list.pop();
                 } else {
-                    return list.toOwnedSlice();
+                    return self.list.toOwnedSlice();
                 }
             }
-            try list.append(b);
+            try self.list.append(b);
             seen_bl = b == '\\';
         }
     }
 
     fn nextLabel(self: *Self) ![]const u8 {
-        var list = std.ArrayList(u8).init(self.arena.allocator());
         while (self.nextChar()) |b| switch (b) {
             '\n', ';', ' ', '\t' => {
                 self.index -= 1;
                 break;
             },
-            else => try list.append(b),
+            else => try self.list.append(b),
         };
-        if (list.items.len == 0) return error.EmptyLabel;
-        return list.toOwnedSlice();
+        if (self.list.items.len == 0) return error.EmptyLabel;
+        return self.list.toOwnedSlice();
     }
 
     fn nextOption(self: *Self) !?u8 {
@@ -409,6 +414,19 @@ pub const Generator = struct {
                         .repl = repl,
                         .flags = opts,
                     } };
+                },
+                'y' => {
+                    const delim = try self.getDelim();
+                    // TODO: Detect LC_COLLATE to disable UTF-8 support.
+                    ret.cmd = .{ .translate = undefined };
+                    inline for (.{ "from", "to" }) |direction| {
+                        const raw = try self.nextArg(delim);
+                        var codepoints = std.ArrayList(u21).init(self.arena.allocator());
+                        var raw_utf8 = try UnicodeView.init(raw);
+                        var raw_it = raw_utf8.iterator();
+                        while (raw_it.nextCodepoint()) |c21| try codepoints.append(c21);
+                        @field(ret.cmd.translate, direction) = codepoints.toOwnedSlice();
+                    }
                 },
                 'h' => ret.cmd = .{ .to_hold = true },
                 'H' => ret.cmd = .{ .to_hold = false },
@@ -559,8 +577,8 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
             if (a.?.invert) return !ret else return ret;
         }
 
-        const RunError = Pcre.PcreError || error{ OutOfMemory, DeleteCommand, QuitCommand, NotImplemented, IOError };
-        fn runInstructions(self: *Self, input: []SedInstruction) RunError!void {
+        const RunError = Pcre.PcreError || error{ OutOfMemory, DeleteCommand, QuitCommand, NotImplemented, IOError, InvalidUtf8 };
+        fn runInstructions(self: *Self, input: []SedInstruction) !void {
             var i: usize = 0;
             while (i < input.len) { // no : (i += 1) because of jumps
                 var item = &input[i];
@@ -686,6 +704,25 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
                             // put it back
                             self.pattern_space.clearRetainingCapacity();
                             try self.pattern_space.appendSlice(subject);
+                        }
+                    },
+                    .translate => |y| {
+                        const subject = self.pattern_space.toOwnedSlice();
+                        defer self.alloc.free(subject);
+                        var pat_utf8 = try UnicodeView.init(subject);
+                        var pat_it = pat_utf8.iterator();
+                        while (pat_it.nextCodepointSlice()) |cp_s| {
+                            const cp = std.unicode.utf8Decode(cp_s) catch unreachable;
+                            for (y.from) |from, index| {
+                                if (cp == from) {
+                                    var utf8_buf: [4]u8 = undefined;
+                                    const utf8_len = try std.unicode.utf8Encode(y.to[std.math.min(index, y.to.len - 1)], &utf8_buf);
+                                    try self.pattern_space.appendSlice(utf8_buf[0..utf8_len]);
+                                    break;
+                                }
+                            } else {
+                                try self.pattern_space.appendSlice(cp_s);
+                            }
                         }
                     },
                     .group => {},

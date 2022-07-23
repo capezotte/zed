@@ -709,6 +709,7 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
                         var match_data = try Pcre.MatchData.init(s.regex);
                         defer match_data.deinit();
                         var match_it = Pcre.MatchIterator.init(s.regex, match_data, subject);
+                        match_it.reset(); // allows to avoid recompiling the regex
                         const has_match = b: {
                             var match_index: usize = 0;
                             const expect = s.flags.nth orelse 0;
@@ -719,8 +720,8 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
                         };
                         if (has_match) {
                             // do the replacement in the basement
-                            const offset = std.math.min(match_it.ovector.?[0], subject.len); // TODO: find out how to actually use ovector
-                            //std.debug.print("STARTING {d} at {s}\n", .{ offset, subject });
+                            const offset = match_it.ovector.?[0];
+                            // std.debug.print("STARTING {d} at {s}\n", .{ offset, subject });
                             const the_slice = try Pcre.replace(s.regex, subject, offset, s.repl, self.pattern_space.items, .{
                                 .bits = if (s.flags.global) Pcre.pcre2.PCRE2_SUBSTITUTE_GLOBAL else 0,
                                 .data_opt = match_data,

@@ -614,41 +614,38 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
                         }
                     },
                     .substitute => |s| {
-                        const subject = self.pattern_space.toOwnedSlice();
-                        defer self.alloc.free(subject);
-                        try self.pattern_space.ensureUnusedCapacity(buf_size);
-                        self.pattern_space.expandToCapacity();
-                        // Query for matches.
                         var match_data = try Pcre.MatchData.init(s.regex);
                         defer match_data.deinit();
-                        var match_it = Pcre.MatchIterator.init(s.regex, match_data, subject);
-                        match_it.reset(); // allows to avoid recompiling the regex
-                        const has_match = b: {
-                            var match_index: usize = 0;
-                            const expect = s.flags.nth orelse 0;
-                            while (try match_it.next()) : (match_index += 1) {
-                                if (match_index == expect) break :b true;
+                        if (try Pcre.match(s.regex, self.pattern_space.items, 0, &match_data, .{})) {
+                            var match_it = Pcre.MatchIterator.init(s.regex, match_data, self.pattern_space.items);
+                            // Query for matches.
+                            const has_match = b: {
+                                var match_index: usize = 0;
+                                const expect = s.flags.nth orelse 0;
+                                while (try match_it.next()) : (match_index += 1) {
+                                    if (match_index == expect) break :b true;
+                                }
+                                break :b false;
+                            };
+                            if (has_match) {
+                                const subject = self.pattern_space.toOwnedSlice();
+                                defer self.alloc.free(subject);
+                                try self.pattern_space.ensureUnusedCapacity(buf_size);
+                                self.pattern_space.expandToCapacity();
+                                // do the replacement in the basement
+                                const offset = match_it.ovector.?[0];
+                                // std.debug.print("STARTING {d} at {s}\n", .{ offset, subject });
+                                const the_slice = try Pcre.replace(s.regex, subject, offset, s.repl, self.pattern_space.items, .{
+                                    .bits = if (s.flags.global) Pcre.pcre2.PCRE2_SUBSTITUTE_GLOBAL else 0,
+                                    .data_opt = match_data,
+                                });
+                                // hide the uninitialized 640k
+                                self.pattern_space.shrinkRetainingCapacity(the_slice.len);
+                                // p option
+                                if (s.flags.print) {
+                                    try self.printPatternSpace();
+                                }
                             }
-                            break :b false;
-                        };
-                        if (has_match) {
-                            // do the replacement in the basement
-                            const offset = match_it.ovector.?[0];
-                            // std.debug.print("STARTING {d} at {s}\n", .{ offset, subject });
-                            const the_slice = try Pcre.replace(s.regex, subject, offset, s.repl, self.pattern_space.items, .{
-                                .bits = if (s.flags.global) Pcre.pcre2.PCRE2_SUBSTITUTE_GLOBAL else 0,
-                                .data_opt = match_data,
-                            });
-                            // hide the uninitialized 640k
-                            self.pattern_space.shrinkRetainingCapacity(the_slice.len);
-                            // p option
-                            if (s.flags.print) {
-                                try self.printPatternSpace();
-                            }
-                        } else {
-                            // put it back
-                            self.pattern_space.clearRetainingCapacity();
-                            try self.pattern_space.appendSlice(subject);
                         }
                     },
                     .translate => |y| {

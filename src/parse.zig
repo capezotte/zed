@@ -5,7 +5,7 @@ const UnicodeView = std.unicode.Utf8View;
 const LineFeeder = @import("line_feeder.zig").LineFeeder;
 const mem = std.mem;
 
-pub const Command = enum { substitute, print, delete, insert, to_hold, to_pattern, exchange, next_line, quit, translate, group, jump, tmp_jump, unambiguous_print, file };
+pub const Command = enum { substitute, print, delete, insert, to_hold, to_pattern, exchange, next_line, quit, translate, group, jump, tmp_jump, unambiguous_print, file, nil };
 
 pub const AddressKind = union(enum) {
     Regex: Regex,
@@ -51,7 +51,8 @@ pub const SedInstruction = struct {
             read: bool,
             path: []const u8,
         },
-    },
+        nil: void,
+    } = .nil,
 };
 
 const SubstituteFlags = struct {
@@ -262,7 +263,7 @@ pub const Generator = struct {
     fn work(self: *Self) GeneratorError![]SedInstruction {
         var output = std.ArrayList(SedInstruction).init(self.arena.allocator());
         while (true) {
-            var ret = SedInstruction{ .cmd = .{ .tmp_jump = undefined } };
+            var ret = SedInstruction{};
             self.skipWhitespace();
             if (self.peekChar() == @as(u8, '#')) {
                 self.comment();
@@ -318,13 +319,15 @@ pub const Generator = struct {
                     if (my_level != self.group_level) return error.UnmatchedBraces;
                     defer self.arena.allocator().free(group_cmds);
                     ret.cmd = .{ .group = group_cmds.len };
-                    // append, we're going to skip
                     try output.append(ret);
                     try output.appendSlice(group_cmds);
-                    continue;
+                    ret = SedInstruction{};
                 },
                 'p', 'P' => ret.cmd = .{ .print = isL(cmd) },
                 'd', 'D' => ret.cmd = .{ .delete = isL(cmd) },
+                'h', 'H' => ret.cmd = .{ .to_hold = isL(cmd) },
+                'g', 'G' => ret.cmd = .{ .to_pattern = isL(cmd) },
+                'n', 'N' => ret.cmd = .{ .next_line = isL(cmd) },
                 'q' => ret.cmd = .quit,
                 'i', 'a' => ret.cmd = .{ .insert = .{ .before = cmd == 'i', .contents = try self.nextText() } },
                 's' => {
@@ -360,12 +363,6 @@ pub const Generator = struct {
                         @field(ret.cmd.translate, direction) = codepoints.toOwnedSlice();
                     }
                 },
-                'h' => ret.cmd = .{ .to_hold = true },
-                'H' => ret.cmd = .{ .to_hold = false },
-                'g' => ret.cmd = .{ .to_pattern = true },
-                'G' => ret.cmd = .{ .to_pattern = false },
-                'n' => ret.cmd = .{ .next_line = true },
-                'N' => ret.cmd = .{ .next_line = false },
                 ':' => {
                     const label = try self.nextLabel();
                     var label_entry = try self.labels.getOrPut(label);
@@ -389,27 +386,7 @@ pub const Generator = struct {
                         } };
                     }
                 },
-                '\n', ';' => {
-                    if (ret.address1 == null) {
-                        continue;
-                    } else {
-                        std.log.err("Address without command found.", .{});
-                        return error.ExpectedCommand;
-                    }
-                },
-                '}' => {
-                    // avoid returning uninitialized command
-                    if (ret.address1 == null) {
-                        if (self.group_level == 0) {
-                            return error.UnmatchedBraces;
-                        }
-                        self.group_level -= 1;
-                        return output.toOwnedSlice();
-                    } else {
-                        std.log.err("Tried to make }} command accept addresses.\n", .{});
-                        return error.ExpectedCommand;
-                    }
-                },
+                '\n', ';', '}' => self.index -= 1, // endings
                 else => {
                     std.log.err("Unknown command: '{c}'", .{cmd});
                     return error.UnknownCommand;
@@ -417,20 +394,26 @@ pub const Generator = struct {
             }
 
             self.skipWhitespace();
-
+            // append command
+            if (ret.cmd != .nil) {
+                try output.append(ret);
+            } else if (ret.address1 != null) {
+                std.log.err("Address without command found.", .{});
+                return error.ExpectedAddress;
+            }
             // look for a closure
             const semicolon = self.nextChar() orelse {
                 try output.append(ret);
                 break;
             };
             switch (semicolon) {
-                '\n', ';' => try output.append(ret),
+                '\n', ';' => {},
                 '}' => {
                     if (self.group_level == 0) {
                         return error.UnmatchedBraces;
                     }
                     self.group_level -= 1;
-                    try output.append(ret);
+                    // end early
                     return output.toOwnedSlice();
                 },
                 else => {
@@ -692,8 +675,8 @@ pub fn Runner(comptime Source: type, comptime Writer: type) type {
                         i = b;
                         continue;
                     },
-                    .tmp_jump => {
-                        std.log.err("Uninitialized jump instruction, file a bug", .{});
+                    .tmp_jump, .nil => {
+                        std.log.err("Uninitialized instruction, file a bug", .{});
                         std.os.exit(1);
                     },
                     else => return error.NotImplemented,
